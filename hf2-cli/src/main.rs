@@ -59,7 +59,7 @@ fn main() {
         Cmd::info => info(&d),
         Cmd::bininfo => bininfo(&d),
         Cmd::dmesg => dmesg(&d),
-        Cmd::flash { file, address } => flash(file, address, &d),
+        Cmd::flash { file, address, skip_checksum } => flash(file, address, &d, skip_checksum),
         Cmd::verify { file, address } => verify(file, address, &d),
     }
 }
@@ -84,7 +84,7 @@ fn dmesg(d: &HidDevice) {
     println!("{:?}", dmesg);
 }
 
-fn flash(file: PathBuf, address: u32, d: &HidDevice) {
+fn flash(file: PathBuf, address: u32, d: &HidDevice, skip_checksum: bool) {
     let bininfo = hf2::bin_info(&d).expect("bin_info failed");
     log::debug!("{:?}", bininfo);
 
@@ -110,45 +110,57 @@ fn flash(file: PathBuf, address: u32, d: &HidDevice) {
         binary.push(0x0);
     }
 
-    // get checksums of existing pages
-    let top_address = address + padded_size as u32;
-    let max_pages = bininfo.max_message_size / 2 - 2;
-    let steps = max_pages * bininfo.flash_page_size;
-    let mut device_checksums = vec![];
+    if skip_checksum {
+        for (page_index, page) in binary.chunks(bininfo.flash_page_size as usize).enumerate() {
+            let mut xmodem = CRCu16::crc16xmodem();
 
-    for target_address in (address..top_address).step_by(steps as usize) {
-        let pages_left = (top_address - target_address) / bininfo.flash_page_size;
-
-        let num_pages = if pages_left < max_pages {
-            pages_left
-        } else {
-            max_pages
-        };
-        let chk =
-            hf2::checksum_pages(&d, target_address, num_pages).expect("checksum_pages failed");
-        device_checksums.extend_from_slice(&chk.checksums[..]);
-    }
-    log::debug!("checksums received {:04X?}", device_checksums);
-
-    // only write changed contents
-    for (page_index, page) in binary.chunks(bininfo.flash_page_size as usize).enumerate() {
-        let mut xmodem = CRCu16::crc16xmodem();
-
-        xmodem.digest(&page);
-
-        if xmodem.get_crc() != device_checksums[page_index] {
-            log::debug!(
-                "ours {:04X?} != {:04X?} theirs, updating page {}",
-                xmodem.get_crc(),
-                device_checksums[page_index],
-                page_index,
-            );
+            xmodem.digest(&page);
 
             let target_address = address + bininfo.flash_page_size * page_index as u32;
             let _ = hf2::write_flash_page(&d, target_address, page.to_vec())
                 .expect("write_flash_page failed");
-        } else {
-            log::debug!("not updating page {}", page_index,);
+        }
+    } else {
+        // get checksums of existing pages
+        let top_address = address + padded_size as u32;
+        let max_pages = bininfo.max_message_size / 2 - 2;
+        let steps = max_pages * bininfo.flash_page_size;
+        let mut device_checksums = vec![];
+
+        for target_address in (address..top_address).step_by(steps as usize) {
+            let pages_left = (top_address - target_address) / bininfo.flash_page_size;
+
+            let num_pages = if pages_left < max_pages {
+                pages_left
+            } else {
+                max_pages
+            };
+            let chk =
+                hf2::checksum_pages(&d, target_address, num_pages).expect("checksum_pages failed");
+            device_checksums.extend_from_slice(&chk.checksums[..]);
+        }
+        log::debug!("checksums received {:04X?}", device_checksums);
+
+        // only write changed contents
+        for (page_index, page) in binary.chunks(bininfo.flash_page_size as usize).enumerate() {
+            let mut xmodem = CRCu16::crc16xmodem();
+
+            xmodem.digest(&page);
+
+            if xmodem.get_crc() != device_checksums[page_index] {
+                log::debug!(
+                    "ours {:04X?} != {:04X?} theirs, updating page {}",
+                    xmodem.get_crc(),
+                    device_checksums[page_index],
+                    page_index,
+                );
+
+                let target_address = address + bininfo.flash_page_size * page_index as u32;
+                let _ = hf2::write_flash_page(&d, target_address, page.to_vec())
+                    .expect("write_flash_page failed");
+            } else {
+                log::debug!("not updating page {}", page_index,);
+            }
         }
     }
 
@@ -250,6 +262,8 @@ pub enum Cmd {
         file: PathBuf,
         #[structopt(short = "a", name = "address", long = "address", parse(try_from_str = parse_hex_32))]
         address: u32,
+        #[structopt(short, long)]
+        skip_checksum: bool,
     },
 
     /// verify
